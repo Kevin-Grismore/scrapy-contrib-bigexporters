@@ -329,6 +329,9 @@ class ParquetItemExporter(BaseItemExporter):
         if isinstance(item, dict):
             # for dicts try using fields of the first item
             self.columns = list(item.keys())
+        elif hasattr(item, "__dataclass_fields__"):
+             # for dataclasses
+            self.columns = list(getattr(item, "__dataclass_fields__").keys())
         else:
             # use fields declared in Item
             self.columns = list(item.fields.keys())
