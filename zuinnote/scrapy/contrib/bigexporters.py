@@ -228,8 +228,8 @@ import logging
 SUPPORTED_EXPORTERS = {}
 ### Check which libraries are available for the exporters
 try:
-    from fastparquet import write as fp_write
-    import pandas as pd
+    #from fastparquet import write as fp_write
+    #import pandas as pd
 
     SUPPORTED_EXPORTERS["parquet"] = True
     logging.getLogger().info(
