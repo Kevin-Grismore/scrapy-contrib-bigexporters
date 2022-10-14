@@ -72,10 +72,12 @@ FEEDS = {
 see: https://docs.scrapy.org/en/latest/topics/exporters.html
 """
 
-from scrapy.exporters import BaseItemExporter
-from scrapy.utils.project import get_project_settings
-
+import typing as t
 import logging
+
+from scrapy.exporters import BaseItemExporter
+
+MAX_FILE_SIZE = int(1.2e8)
 
 SUPPORTED_EXPORTERS = {}
 ### Check which libraries are available for the exporters
@@ -104,10 +106,11 @@ class ParquetItemExporter(BaseItemExporter):
         self.file = file  # file name
         self.item_count = 0
         self.file_count = 0
-        self.records = []
+        self.item_batch = []
         self.logger = logging.getLogger()
         self._configure(kwargs, dont_fail=dont_fail)
         self.filesystem = self._create_filesystem()
+        self.records = PyarrowBatchBuffer()
 
     def _configure(self, options, dont_fail=False):
         """Configure the exporter by poping options from the ``options`` dict.
@@ -122,40 +125,62 @@ class ParquetItemExporter(BaseItemExporter):
         # Params for write_table
         self.compression = options.pop("compression", "SNAPPY")
         # Other control options
-        self.items_per_file = options.pop("items_per_file", 10000)
-        self.gcp_service_account_info = options.pop("gcp_service_account_info", None)
+        self.items_per_file = options.pop("items_per_file", 1000)
+        self.gcp_credentials_block = options.pop("gcp_credentials_block", None)
+        self.aws_credentials_block = options.pop("aws_credentials_block", None)
 
     def _create_filesystem(self):
         """
         Check for a prefix on the file name string and create the corresponding
-        pyarrow filesystem
+        pyarrow filesystem, to be used in the filesystem arg in pa.parquet.write_table()
+
+        Remote filesystems should be instantiated with their credentials if not running
+        in an environment where the credentials exist as environemnt variables.
         """
 
-        if self.file.startswith("gcs://"):
-            return fs.GcsFileSystem(target_service_account=self.gcp_service_account_info)
+        if self.file.startswith("gcs://") and self.gcp_credentials_block:
+            service_account_info = self.gcp_credentials_block.get('service_account_info', None)
+            return fs.GcsFileSystem(
+                target_service_account=service_account_info,
+            )
 
-        # elif
+        # TODO: it seems like a good idea to support the S3 filesystem here as well
+        # elif file starts with "s3://":
+        #     return an S3 filesystem built with the required credentials as if
+        #     they were passed in from a prefect-aws aws credentials block
+        #     https://prefecthq.github.io/prefect-aws/credentials/
 
         else:
             return fs.LocalFileSystem()
 
     def export_item(self, item):
         """
-        Add a record to the PyarrowBatchBuffer. Write a file if items_per_file is exceeded.
+        Add a record to the PyarrowBatchBuffer. Write a file if items_per_file or
+        MAX_FILE_SIZE is exceeded.
         """
-        if self.item_count > self.items_per_file:
+        # Write the table if the batch buffer has reached or exceeded the max
+        # file size. This is a backup method if a record batch becomes too large,
+        # since the batch size is user-configurable.
+        if self.records.should_flush():
             self._write_table_to_file()
 
-        record = dict(self._get_serialized_fields())
-        self.records.append(record)
+        # Or, if the batch is full, add it to the batch buffer, clear the
+        # batch, then write the file.
+        elif len(self.item_batch) > self.items_per_file:
+            self.records.insert(self.item_batch)
+            self.item_batch = []
+            self._write_table_to_file()
 
+        record = dict(self._get_serialized_fields(item))
+
+        self.item_batch.append(record)
         self.item_count += 1
 
     def _write_table_to_file(self):
         """
         Turn the PyarrowBatchBuffer into a Table, then write it to a file.
         """
-        table = pa.Table.from_pylist(self.records)
+        table = pa.Table.from_batches(self.records.flush())
         pa.parquet.write_table(
             table=table,
             where=f"{self.file}-{self.file_count}",
@@ -180,3 +205,36 @@ class ParquetItemExporter(BaseItemExporter):
         Triggered when Scrapy ends exporting. Useful to shutdown threads, close files etc.
         """
         self._write_table_to_file()
+
+
+class PyarrowBatchBuffer:
+    """
+    Used to track state during a transformation from an iterable of dictionaries to an iterable of pyarrow tables
+    """
+
+    def __init__(self, target_size: int = MAX_FILE_SIZE):
+        self._size: int = 0
+        self._batches: t.List[pa.RecordBatch] = []
+        self.target_size = target_size
+
+    def clear(self):
+        self._size = 0
+        self._batches = []
+
+    def insert(self, records: t.Iterable[t.Dict]):
+        batch = pa.RecordBatch.from_struct_array(pa.array(records))
+        self._size += batch.nbytes
+        self._batches.append(batch)
+
+    def should_flush(self) -> bool:
+        return self._size >= self.target_size
+
+    def flush(self, clear: bool = True) -> t.List[pa.RecordBatch]:
+        # returns current batches in buffer and optionally calls self.clear()
+        _ = self._batches.copy()
+        if clear:
+            self.clear()
+        return _
+
+    def __bool__(self):
+        return bool(self._batches)
