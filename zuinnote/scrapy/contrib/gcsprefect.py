@@ -50,7 +50,7 @@ class GCSFeedStorage(BlockingFeedStorage):
         self.blob_name = u.path[1:]  # remove first "/"
 
     @classmethod
-    def from_crawler(cls, crawler, uri):
+    def from_crawler(cls, crawler, uri, feed_options):
         return cls(
             uri,
             crawler.settings["GCS_PROJECT_ID"] or None,
